@@ -4,7 +4,7 @@
 
 ## 公開先
 
-https://makiabe.github.io/emoi-cat/
+[https://makiabe.github.io/emoi-cat//index.html](https://makiabe.github.io/emoi-cat/index.html)
 
 ## 操作
 
