@@ -5,17 +5,25 @@ on:
     branches: [main]
   workflow_dispatch:
 
+concurrency:
+  group: cat-day-pages
+  cancel-in-progress: false
+
 permissions:
   contents: read
 
-concurrency:
-  group: pages
-  cancel-in-progress: false
-
 jobs:
-  build:
+  publish:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.settings.outputs.url }}
     steps:
       - name: Checkout source
         uses: actions/checkout@v6
@@ -24,26 +32,76 @@ jobs:
         with:
           node-version: '22'
           package-manager-cache: false
-      - name: Build and validate
-        run: node tools/check-build.js
+      - name: Read existing Pages publishing source
+        id: settings
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/pages" > "$RUNNER_TEMP/cat-day-pages.json"
+          node <<'NODE'
+          const fs = require('node:fs');
+          const site = JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP + '/cat-day-pages.json', 'utf8'));
+          const mode = site.build_type || 'legacy';
+          if (!['legacy', 'workflow'].includes(mode)) throw new Error('Unsupported Pages build type');
+          if (mode === 'legacy' && (site.source?.branch !== 'main' || !['/', '/docs'].includes(site.source?.path))) {
+            throw new Error('Branch publishing must use main / (root) or main /docs. Existing settings were not changed.');
+          }
+          const url = new URL(site.html_url);
+          if (url.protocol !== 'https:') throw new Error('Pages URL must use HTTPS');
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `mode=${mode}\ndirectory=${site.source?.path === '/docs' ? 'docs' : '.'}\nurl=${url.href}\n`);
+          console.log(`Pages source: ${mode}; ${site.source?.branch || ''}${site.source?.path || ''}; ${url.href}`);
+          NODE
+      - name: Build and validate animation
+        run: |
+          node tools/check-build.js
+          node <<'NODE'
+          const fs = require('node:fs');
+          const { createHash } = require('node:crypto');
+          const contentHash = createHash('sha256').update(fs.readFileSync('out/index.html')).digest('hex');
+          fs.writeFileSync('out/deployment.json', JSON.stringify({ source_commit: process.env.GITHUB_SHA, content_sha256: contentHash }) + '\n');
+          NODE
+      - name: Publish generated files to the configured branch directory
+        if: steps.settings.outputs.mode == 'legacy'
+        env:
+          SITE_DIRECTORY: ${{ steps.settings.outputs.directory }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$SITE_DIRECTORY"
+          for file in index.html player.html cat_day.svg deployment.json .nojekyll; do
+            cp "out/$file" "$SITE_DIRECTORY/$file"
+            git add -- "$SITE_DIRECTORY/$file"
+          done
+          if ! git diff --cached --quiet; then
+            git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m "build: publish Cat's Day player from ${GITHUB_SHA:0:7}"
+            git push origin HEAD:refs/heads/main
+          fi
+          # GITHUB_TOKEN commits do not trigger Pages builds, so request one explicitly.
+          gh api --method POST "repos/$GITHUB_REPOSITORY/pages/builds"
       - name: Upload Pages artifact
+        if: steps.settings.outputs.mode == 'workflow'
         uses: actions/upload-pages-artifact@v4
         with:
           path: out
-
-  deploy:
-    needs: build
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - name: Configure Pages
-        uses: actions/configure-pages@v5
-      - name: Deploy to GitHub Pages
-        id: deployment
+      - name: Deploy Pages artifact
+        if: steps.settings.outputs.mode == 'workflow'
         uses: actions/deploy-pages@v4
+      - name: Verify the public page contains this exact player
+        env:
+          SITE_URL: ${{ steps.settings.outputs.url }}
+        run: node tools/check-live.js
+      - name: Install browser test tools
+        run: |
+          npm install --prefix "$RUNNER_TEMP/cat-day-browser" --no-package-lock --no-audit --no-fund playwright@1.57.0
+          "$RUNNER_TEMP/cat-day-browser/node_modules/.bin/playwright" install --with-deps chromium
+      - name: Test playback, all six scenes, chapters, and sound on the public site
+        env:
+          SITE_URL: ${{ steps.settings.outputs.url }}
+          PLAYWRIGHT_MODULE: ${{ runner.temp }}/cat-day-browser/node_modules/playwright
+        run: node tools/check-live.js --browser
+      - name: Save public-site verification screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: public-site-verification
+          path: out/verification
+          if-no-files-found: ignore
